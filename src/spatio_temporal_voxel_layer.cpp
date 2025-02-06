@@ -41,6 +41,7 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
+#include <filesystem>
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_layer.hpp"
 
@@ -122,6 +123,15 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   // whether to map or navigate
   declareParameter("mapping_mode", rclcpp::ParameterValue(false));
   node->get_parameter(name_ + ".mapping_mode", _mapping_mode);
+  // enable autosaving of the map
+  declareParameter("autosaving_enabled", rclcpp::ParameterValue(false));
+  node->get_parameter(name_ + ".autosaving_enabled", _autosaving_enabled);
+  // path to the stvl map path
+  declareParameter("stvl_map_file", rclcpp::ParameterValue(std::string("")));
+  node->get_parameter(name_ + ".stvl_map_file", _stvl_map_file);
+  // enable loading of nav data
+  declareParameter("should_load_navigation_data", rclcpp::ParameterValue(false));
+  node->get_parameter(name_ + ".should_load_navigation_data", _should_load_navigation_data);
   // if mapping, how often to save a map for safety
   declareParameter("map_save_duration", rclcpp::ParameterValue(60.0));
   node->get_parameter(name_ + ".map_save_duration", map_save_time);
@@ -154,9 +164,31 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   _grid_saver = node->create_service<spatio_temporal_voxel_layer::srv::SaveGrid>(
     "save_grid", save_grid_callback, rmw_qos_profile_services_default, callback_group_);
 
-  _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
-    node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
-    _voxel_decay, _publish_voxels);
+  auto clear_grid_around_pose_callback = std::bind(
+    &SpatioTemporalVoxelLayer::ClearGridAroundPoseCallback, this, _1, _2, _3);
+  _clear_grid_around_pose_srv = node->create_service<nav2_msgs::srv::ClearGridAroundPose>(
+    "clear_grid_around_pose", clear_grid_around_pose_callback, rmw_qos_profile_services_default, callback_group_);
+
+  auto save_stvl_map_callback = std::bind(
+    &SpatioTemporalVoxelLayer::SaveStvlMapCallback, this, _1, _2, _3);
+  _save_stvl_map_srv = node->create_service<std_srvs::srv::Trigger>(
+    "spatiotemporal_voxel_grid/save_stvl_map", save_stvl_map_callback, rmw_qos_profile_services_default, callback_group_);
+
+  auto erase_stvl_map_callback = std::bind(
+    &SpatioTemporalVoxelLayer::EraseStvlMapCallback, this, _1, _2, _3);
+  _erase_stvl_map_srv = node->create_service<std_srvs::srv::Trigger>(
+    "spatiotemporal_voxel_grid/erase_stvl_map", erase_stvl_map_callback, rmw_qos_profile_services_default, callback_group_);
+
+  if(_mapping_mode)
+  {
+    InitializeVoxelGrid(node->get_clock());
+  }
+  else
+  {
+    _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
+      node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
+      _voxel_decay, _publish_voxels, false);
+  }
 
   matchSize();
 
@@ -357,6 +389,51 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   was_reset_ = false;
 
   RCLCPP_INFO(logger_, "%s initialization complete!", getName().c_str());
+}
+
+void SpatioTemporalVoxelLayer::InitializeVoxelGrid(const std::shared_ptr<rclcpp::Clock> & clock)
+{
+  bool should_load_navigation_data = _should_load_navigation_data;
+  bool stvl_ready = false;
+  while (!stvl_ready)
+  {
+    try
+    {
+    	_voxel_grid.reset();
+      
+      if (should_load_navigation_data)
+      {
+        RCLCPP_INFO(logger_, "Attempting to load STVL map.");
+        _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(clock, \
+                                                                           _voxel_size, \
+                                                                           (double)default_value_, \
+                                                                           _decay_model, \
+                                                                           _voxel_decay, \
+                                                                           _publish_voxels, \
+                                                                           true, \
+                                                                           _stvl_map_file);
+      }
+      else
+      {
+        RCLCPP_INFO(logger_, "STVL starting clean.");
+        _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(clock, \
+                                                                           _voxel_size, \
+                                                                           (double)default_value_, \
+                                                                           _decay_model, \
+                                                                           _voxel_decay, \
+                                                                           _publish_voxels, \
+                                                                           false);
+      }
+
+      stvl_ready = true;
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_INFO_STREAM(logger_, "Failed to start STVL: " << e.what()
+                        << "\n\nWill retry without loading navigation data.");
+      should_load_navigation_data = false;
+    }
+  }
 }
 
 /*****************************************************************************/
@@ -592,15 +669,17 @@ void SpatioTemporalVoxelLayer::reset(void)
   boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
   // reset layer
   Costmap2D::resetMaps();
-  this->ResetGrid();
+  // Removed to stop the global voxel grid from being deleted
+  // this->ResetGrid();
 
   current_ = false;
   was_reset_ = true;
 
-  observation_buffers_iter it = _observation_buffers.begin();
-  for (; it != _observation_buffers.end(); ++it) {
-    (*it)->ResetLastUpdatedTime();
-  }
+  // Removed to stop the global voxel grid from being deleted
+  // observation_buffers_iter it = _observation_buffers.begin();
+  // for (; it != _observation_buffers.end(); ++it) {
+  //   (*it)->ResetLastUpdatedTime();
+  // }
 }
 
 /*****************************************************************************/
@@ -768,23 +847,15 @@ void SpatioTemporalVoxelLayer::updateBounds(
   if (_map_save_duration) {
     should_save = node->now() - _last_map_save_time > *_map_save_duration;
   }
-  if (!_mapping_mode) {
-    _voxel_grid->ClearFrustums(clearing_observations, cleared_cells);
-  } else if (should_save) {
-    _last_map_save_time = node->now();
-    time_t rawtime;
-    struct tm * timeinfo;
-    char time_buffer[100];
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);  //NOLINT
-    strftime(time_buffer, 100, "%F-%r", timeinfo);
+  
+  _voxel_grid->ClearFrustums(clearing_observations, cleared_cells);
 
-    auto request =
-      std::make_shared<spatio_temporal_voxel_layer::srv::SaveGrid::Request>();
+  if (_mapping_mode && _autosaving_enabled && should_save) {    
+    _last_map_save_time = node->now();
+
     auto response =
-      std::make_shared<spatio_temporal_voxel_layer::srv::SaveGrid::Response>();
-    request->file_name = time_buffer;
-    SaveGridCallback(nullptr, request, response);
+      std::make_shared<std_srvs::srv::Trigger::Response>();
+    SaveStvlMapCallback(nullptr, nullptr, response);
   }
 
   // mark observations
@@ -793,8 +864,8 @@ void SpatioTemporalVoxelLayer::updateBounds(
   // update the ROS Layered Costmap
   UpdateROSCostmap(min_x, min_y, max_x, max_y, cleared_cells);
 
-  // publish point cloud in navigation mode
-  if (_publish_voxels && !_mapping_mode) {
+  // publish point cloud
+  if (_publish_voxels) {
     std::unique_ptr<sensor_msgs::msg::PointCloud2> pc2 =
       std::make_unique<sensor_msgs::msg::PointCloud2>();
     _voxel_grid->GetOccupancyPointCloud(pc2);
@@ -830,6 +901,112 @@ void SpatioTemporalVoxelLayer::SaveGridCallback(
   RCLCPP_WARN(logger_, "SpatioTemporalVoxelLayer: Failed to save grid.");
   resp->status = false;
 }
+
+/*****************************************************************************/
+void SpatioTemporalVoxelLayer::ClearGridAroundPoseCallback(
+  const std::shared_ptr<rmw_request_id_t>/*header*/,
+  std::shared_ptr<nav2_msgs::srv::ClearGridAroundPose::Request> req,
+  std::shared_ptr<nav2_msgs::srv::ClearGridAroundPose::Response> resp)
+/*****************************************************************************/
+{
+  boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+  try
+  {
+    clearCostmapLayerAroundPose(req->pose.pose.position.x, req->pose.pose.position.y, req->reset_distance);
+    resp->status = true;
+    return;
+  }
+  catch(const std::exception& e)
+  {
+    RCLCPP_WARN_STREAM(logger_, "SpatioTemporalVoxelLayer: Failed to remove grid around pose with exception: " << e.what());
+  }
+  resp->status = false;
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelLayer::SaveStvlMapCallback(
+  const std::shared_ptr<rmw_request_id_t>/*header*/,
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
+/*****************************************************************************/
+{
+  if(!_enabled)
+  {
+    resp->message = "STVL layer disabled, skipping";
+    resp->success = true;
+    return;
+  }
+
+  if(!_mapping_mode)
+  {
+    resp->message = "STVL not in mapping mode, no map to save, skipping";
+    resp->success = true;
+    return;
+  }
+  
+  boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+  double map_size_bytes;
+
+  if( _voxel_grid->SaveGrid(_stvl_map_file, map_size_bytes) )
+  {
+    RCLCPP_INFO(       
+      logger_,
+      "SpatioTemporalVoxelGrid: Saved %s grid! Has memory footprint of %f bytes.",
+      _stvl_map_file.c_str(), map_size_bytes);
+    resp->message = "STVL map saved";
+    resp->success = true;
+    return;
+  }
+
+  resp->message = "STVL failed to save map";
+  resp->success = false;
+  return;
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelLayer::EraseStvlMapCallback(
+  const std::shared_ptr<rmw_request_id_t>/*header*/,
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
+/*****************************************************************************/
+{
+  if(!_mapping_mode)
+  {
+    resp->message = "STVL not in mapping mode, no map to erase, skipping";
+    resp->success = true;
+    return;
+  }
+  
+  try
+  {
+    if (std::filesystem::remove(_stvl_map_file))
+    {
+      resp->success = true;
+      resp->message = "STVL map file deleted";
+    }
+    else
+    {
+      // If map file doesn't exist it is still success - there is no map
+      resp->success = true;
+      resp->message = "Can't delete stvl map file, maybe it doesn't exist?";
+    }
+  }
+  catch (const std::filesystem::filesystem_error& e)
+  {
+    resp->success = false;
+    resp->message = std::string("Can't delete map, exception occurred: ") + e.what();
+    return;
+  }
+
+  if (!_voxel_grid->ResetGrid())
+  {
+    resp->success = false;
+    resp->message = "Failed to clear current stvl map";
+  }
+
+  return;
+}
+
 
 rcl_interfaces::msg::SetParametersResult
 SpatioTemporalVoxelLayer::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters)
@@ -959,6 +1136,26 @@ void SpatioTemporalVoxelLayer::clearArea(
   boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
   _voxel_grid->ResetGridArea(start_world, end_world, invert_area);
   CostmapLayer::clearArea(start_x, start_y, end_x, end_y, invert_area);
+}
+
+void SpatioTemporalVoxelLayer::clearCostmapLayerAroundPose(
+  double pose_x, double pose_y, double reset_distance)
+{
+  double start_point_x = pose_x - reset_distance / 2;
+  double start_point_y = pose_y - reset_distance / 2;
+  double end_point_x = start_point_x + reset_distance;
+  double end_point_y = start_point_y + reset_distance;
+
+  int start_x, start_y, end_x, end_y;
+  this->worldToMapEnforceBounds(start_point_x, start_point_y, start_x, start_y);
+  this->worldToMapEnforceBounds(end_point_x, end_point_y, end_x, end_y);
+
+  // Clear area is called with invert=true as it esnures only the area inside is cleared
+  clearArea(start_x, start_y, end_x, end_y, true);
+
+  double ox = this->getOriginX(), oy = this->getOriginY();
+  double width = this->getSizeInMetersX(), height = this->getSizeInMetersY();
+  this->addExtraBounds(ox, oy, ox + width, oy + height);
 }
 
 }  // namespace spatio_temporal_voxel_layer
